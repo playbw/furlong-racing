@@ -939,6 +939,7 @@
 .sp-tile{width:136px;height:136px;border:none;border-radius:6px;background:rgba(30,34,40,.88);color:#f4f1ea;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font:800 12px var(--body);letter-spacing:.06em;text-transform:uppercase;transition:transform .15s,background .15s;box-shadow:0 10px 26px rgba(0,0,0,.5)}
 .sp-tile.on{background:linear-gradient(180deg,#f3d27a,#e8c15a);color:#111;transform:translateY(-12px) scale(1.06)}
 .sp-tile b{max-width:120px;text-align:center;line-height:1.15}
+.sp-sv{font:600 10px/1.3 var(--body);text-transform:none;letter-spacing:0;opacity:.8;max-width:124px;text-align:center;overflow:hidden}
 .sp-hello{margin-left:auto;text-align:right;font-size:12px;color:rgba(244,241,234,.8)}.sp-hello b{display:block;font-size:14px;color:#fff}
 .sp-hints{position:absolute;left:3vw;bottom:20px;display:flex;gap:22px;font-size:12px;letter-spacing:.08em;color:rgba(244,241,234,.8)}
 .sp-hints kbd{display:inline-block;min-width:18px;padding:1px 6px;margin-right:6px;border-radius:4px;background:rgba(255,255,255,.15);font:700 11px var(--body)}
@@ -13879,6 +13880,13 @@ function saveGame(quiet){
   try { window.localStorage.setItem(SAVE_KEY, JSON.stringify(blob)); ok = true; }
   catch(e){ ok = false; }
   app.lastSave = blob;
+  if(ok){
+    try {
+      show("modeContinue", true);
+      const c = blob.career, sub = $("modeContinueSub");
+      if(sub) sub.textContent = `${c.hq && c.hq.name ? c.hq.name : "Your stable"} \u2014 ${c.horse ? c.horse.name : "no horse"}, week ${c.week} of ${c.year}.`;
+    } catch(e){}
+  }
   if(!quiet){
     modal(ok
       ? `<p>Saved. It will be here when you come back, as long as you use the same
@@ -14221,10 +14229,15 @@ function setupControls(){
   $("hubSave").addEventListener("click", saveMenu);
   $("modeContinue").addEventListener("click", ()=>{ loadGame(); });
   $("hubQuit").addEventListener("click", ()=>{
-    modal("<p>Walking away ends this career. The horse stays where it is and someone else gets the licence.</p>",
-      { kick:"LEAVE", title:"Give up the stable",
-        btns:[{ t:"Stay", go:closeModal },
-              { t:"Leave", go(){ closeModal(); app.career = null; showScreen("title"); } }] });
+    // Leaving never throws a career away: it is saved and waiting under Continue Career.
+    const ok = saveGame(true);
+    if(!ok){
+      modal("<p>This browser wouldn't store the save, so take a copy out to a file before you go.</p>",
+        { kick:"SAVE", title:"Couldn't autosave", btns:[{ t:"Stay", go:closeModal }, { t:"Download a copy", go(){ exportSave(); } },
+          { t:"Leave anyway", go(){ closeModal(); app.career = null; showScreen("title"); } }] });
+      return;
+    }
+    app.career = null; showScreen("title");
   });
 
   for(const [id, key, attr] of [["calType","_calType","c"], ["calClass","_calClass","x"]]){
@@ -14288,7 +14301,7 @@ function setupControls(){
 </script>
 <script>
 // ============================================================================
-//  FURLONG WORLD CHAMPIONSHIP  ·  career mode v35
+//  FURLONG WORLD CHAMPIONSHIP  ·  career mode v37
 //  Story campaign (three books), global points championship, executive suite,
 //  business ventures, and the jockey room with its own academy.
 // ============================================================================
@@ -16110,10 +16123,9 @@ FWC_SCENES.awards = C=>{
 // ============================================================================
 (function f27Front(){
   const MODES = [
-    { k:"continue", t:"Continue Career", d:"Pick up your career exactly where you left it.", icon:"\u25B6", col:"#2e7d4f" },
     { k:"race", t:"Race Day", d:"Set up a single race. Any track, any distance, any going. Watch from the rail or ride it out onboard.", icon:"\u2691", col:"#c8343a" },
     { k:"career", t:"Career", d:"Build a stable from one unraced horse to a fifty-plot empire. Staff, executives, jockeys, ventures and the story of the Furlong World Championship.", icon:"\u265E", col:"#2f6fb5" },
-    { k:"wc", t:"World Championship", d:"Eleven majors on four continents, qualifying on every Grand Prix weekend, and a Final at Flemington. Jump straight to the standings.", icon:"\u2605", col:"#c79a3e" },
+    { k:"continue", t:"Continue Career", d:"Pick up your career exactly where you left it.", icon:"\u25B6", col:"#2e7d4f" },
   ];
   let sel = 1, started = false;
   const icon = m => `<svg viewBox="0 0 80 80" width="74" height="74"><defs><linearGradient id="ti${m.k}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${m.col}"/><stop offset="1" stop-color="#0b0f0d"/></linearGradient></defs>
@@ -16154,14 +16166,16 @@ FWC_SCENES.awards = C=>{
     });
   }
   const hasSave = () => { const b = document.getElementById("modeContinue"); return b && !b.classList.contains("hide"); };
-  const avail = () => MODES.filter(m=>hasSave() || m.k !== "wc");
+  const avail = () => MODES.filter(m=>hasSave() || m.k !== "continue");
+  const saveInfo = () => { try { const c = JSON.parse(localStorage.getItem(SAVE_KEY)).career;
+    return { lodge:(c.hq && c.hq.name) || (c.company && c.company.name) || c.trainer, horse:c.horse ? c.horse.name : "", wk:`Week ${c.week}, ${c.year}` }; } catch(e){ return null; } };
   function paintMenu(){
     const av = avail(); sel = clamp(sel, 0, av.length - 1);
     const m = av[sel];
     document.getElementById("spTitle").textContent = m.t;
-    document.getElementById("spDesc").textContent = m.k === "continue" ? (hasSave() ? (document.getElementById("modeContinueSub") || {}).textContent || m.d : "No saved career on this device yet. Select to load a save file, or start a new one in Career.") : m.d;
+    document.getElementById("spDesc").textContent = m.k === "continue" ? (saveInfo() ? `${saveInfo().lodge} \u00b7 ${saveInfo().horse} \u00b7 ${saveInfo().wk}. Your career autosaves every week.` : m.d) : m.d;
     document.getElementById("f27Splash").style.setProperty("--tint", m.col);
-    document.getElementById("spTiles").innerHTML = av.map((x,i)=>`<button class="sp-tile ${i===sel?"on":""}" data-i="${i}">${icon(x)}<b>${esc(x.t)}</b></button>`).join("");
+    document.getElementById("spTiles").innerHTML = av.map((x,i)=>`<button class="sp-tile ${i===sel?"on":""}" data-i="${i}">${icon(x)}<b>${esc(x.t)}</b>${x.k === "continue" && saveInfo() ? `<small class="sp-sv">${esc(saveInfo().lodge)}<br>${esc(saveInfo().horse)}</small>` : ""}</button>`).join("");
     document.querySelectorAll("#spTiles .sp-tile").forEach(b=>{
       b.addEventListener("mouseenter", ()=>{ if(sel !== +b.dataset.i){ sel = +b.dataset.i; paintMenu(); } });
       b.addEventListener("click", ()=>go(av[+b.dataset.i].k));
@@ -16174,7 +16188,7 @@ FWC_SCENES.awards = C=>{
     started = true;
     document.getElementById("spPress").hidden = true;
     document.getElementById("spMenu").hidden = false;
-    sel = hasSave() ? 0 : 1; paintMenu();
+    sel = hasSave() ? avail().length - 1 : 0; paintMenu();
   }
   function go(k){
     scene3d(false);
@@ -16221,6 +16235,23 @@ FWC_SCENES.awards = C=>{
     return r;
   };
   if(app.screen === "title") setTimeout(show, 60);
+})();
+
+
+// ---- autosave (v36): every week, and whenever the page is hidden or closed ------
+(function f27Autosave(){
+  const _aw = advanceWeek;
+  advanceWeek = function(C){
+    const r = _aw.apply(this, arguments);
+    try { if(app.career === C) saveGame(true); } catch(e){}
+    return r;
+  };
+  const flush = ()=>{ try { if(app.career && app.career.horse) saveGame(true); } catch(e){} };
+  window.addEventListener("beforeunload", flush);
+  window.addEventListener("pagehide", flush);
+  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState === "hidden") flush(); });
+  setInterval(flush, 60000);
+  const q = document.getElementById("hubQuit"); if(q) q.textContent = "Save & exit";
 })();
 
 </script>
