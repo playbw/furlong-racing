@@ -942,6 +942,7 @@
 .sp-sv{font:600 10px/1.3 var(--body);text-transform:none;letter-spacing:0;opacity:.8;max-width:124px;text-align:center;overflow:hidden}
 .sp-hello{margin-left:auto;text-align:right;font-size:12px;color:rgba(244,241,234,.8)}.sp-hello b{display:block;font-size:14px;color:#fff}
 .sp-hints{position:absolute;left:3vw;bottom:20px;display:flex;gap:22px;font-size:12px;letter-spacing:.08em;color:rgba(244,241,234,.8)}
+.sp-hints button{background:none;border:none;color:inherit;font:inherit;letter-spacing:inherit;cursor:pointer;padding:4px 2px}.sp-hints button:hover{color:#e8c15a}
 .sp-hints kbd{display:inline-block;min-width:18px;padding:1px 6px;margin-right:6px;border-radius:4px;background:rgba(255,255,255,.15);font:700 11px var(--body)}
 @media (max-width:820px){.sp-promo{display:none}.sp-tile{width:96px;height:110px}.sp-tile svg{width:52px;height:52px}.sp-row{overflow-x:auto}}
 </style>
@@ -2444,8 +2445,54 @@ function buildCourse(key){
     return { pts, cum, homeLen:t.home, back:A, bigR:R1, smallR:R2 };
   }
 
+  // A traced outline from the real course map: straights and right-hand turns
+  // (mirrored for left-handed tracks), closed and scaled to the true lap.
+  function pathLayout(){
+    const segs = t.shape.segs;
+    const trace = A0 => {
+      const pts = []; let x = 0, z = 0, th = 0;
+      segs.forEach((g, gi)=>{
+        const turn = g.t ? g.t*Math.PI/180 : 0, len = g.t ? g.r*turn : (gi === 0 ? A0 : g.s);
+        const n = Math.max(1, Math.round(len/2)), ds = len/n, kk = g.t ? turn/len : 0;
+        for(let i=0;i<n;i++){
+          pts.push({ x, z, th, k:kk, arc:!!g.t });
+          if(kk === 0){ x += Math.cos(th)*ds; z += Math.sin(th)*ds; }
+          else { const R = 1/kk, cx = x - Math.sin(th)*R, cz = z + Math.cos(th)*R; th += kk*ds; x = cx + Math.sin(th)*R; z = cz - Math.cos(th)*R; }
+        }
+      });
+      return { pts, end:{ x, z } };
+    };
+    const first = segs[0].s;
+    let A = first, lay, sc = 1;
+    for(let pass=0; pass<8; pass++){
+      lay = trace(A);
+      const L = lay.pts.length ? lay.pts.reduce((n,p,i,a)=>n + Math.hypot(a[(i+1)%a.length].x - p.x, a[(i+1)%a.length].z - p.z), 0) : 1;
+      sc = C / L;
+      A *= (t.home / Math.max(20, A*sc));
+    }
+    lay = trace(A);
+    const pts = lay.pts;
+    const drift = { x: pts[0].x - lay.end.x, z: pts[0].z - lay.end.z };
+    let arcs = 0; for(const p of pts) if(p.arc) arcs++;
+    let seen = 0;
+    for(const p of pts){ const f = arcs ? seen/arcs : 0; p.x += drift.x*f; p.z += drift.z*f; if(p.arc) seen++; }
+    let sx = 0, sz = 0;
+    for(const p of pts){ sx += p.x; sz += p.z; }
+    sx /= pts.length; sz /= pts.length;
+    for(const p of pts){ p.x -= sx; p.z -= sz; }
+    const cum = new Float64Array(pts.length + 1);
+    for(let i=0;i<pts.length;i++){ const a = pts[i], b = pts[(i+1) % pts.length]; cum[i+1] = cum[i] + Math.hypot(b.x-a.x, b.z-a.z); }
+    const tot = cum[pts.length];
+    for(const p of pts){ p.x *= C/tot; p.z *= C/tot; }
+    for(let i=0;i<=pts.length;i++) cum[i] *= C/tot;
+    let firstArc = pts.findIndex(p=>p.arc); if(firstArc < 0) firstArc = 1;
+    const longest = segs.slice(1).filter(g=>!g.t).reduce((m,g)=>Math.max(m, g.s), 0) * (C/tot);
+    return { pts, cum, homeLen:cum[firstArc], back:longest || t.home };
+  }
+
   let out;
   if(t.shape && t.shape.kind === "egg") out = eggLayout();
+  else if(t.shape && t.shape.kind === "path") out = pathLayout();
   else {
     let A = t.home;
     let B = Math.max(120, C - A - Math.PI*r*2 + Math.PI*r*0.55);
@@ -3963,6 +4010,52 @@ const Renderer3D = (function(){
         sg.position.set(p.x, 0, p.z); sg.rotation.y = -p.th; g.add(sg);
       });
     } catch(e){}
+    // ---- one-off landmarks, placed from each venue's aerial photo (v42) --------------
+    try {
+      const L = venueKey, bbx = course.bounds;
+      const C0 = new THREE.Vector3(bbx.cx, 0, bbx.cz);
+      const pp = course.at(post, 0);
+      const away = new THREE.Vector3(bbx.cx - pp.x, 0, bbx.cz - pp.z).normalize();      // from the stands, across the course
+      const side = new THREE.Vector3(-away.z, 0, away.x);
+      const far = (d, sx) => C0.clone().addScaledVector(away, d).addScaledVector(side, sx || 0);
+      const M = c => std(c, 0.85);
+      // water runs along a heading (radians in the x/z plane); its length follows that heading
+      const water = (pos, len, wid, head) => { const grp = new THREE.Group();
+        const w = new THREE.Mesh(new THREE.PlaneGeometry(len, wid), new THREE.MeshStandardMaterial({ color:0x3f6f86, roughness:0.25, metalness:0.1 }));
+        w.rotation.x = -Math.PI/2; grp.add(w); grp.rotation.y = -(head || 0); grp.position.set(pos.x, -0.15, pos.z); g.add(grp); };
+      const sideHead = Math.atan2(side.z, side.x);
+      const rot = Math.atan2(away.x, away.z);
+      const mountain = (pos, r, h, col, cap) => { const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, 7), M(col)); m.position.set(pos.x, h/2 - 4, pos.z); g.add(m);
+        if(cap){ const c = new THREE.Mesh(new THREE.ConeGeometry(r*0.32, h*0.32, 7), M(0xf2f4f6)); c.position.set(pos.x, h - h*0.16 - 4, pos.z); g.add(c); } };
+      const tower = (pos, h, w, col, spire) => { const t = new THREE.Mesh(new THREE.BoxGeometry(w, h, w), M(col)); t.position.set(pos.x, h/2, pos.z); g.add(t);
+        if(spire){ const s = new THREE.Mesh(new THREE.ConeGeometry(w*0.35, spire, 6), M(col)); s.position.set(pos.x, h + spire/2, pos.z); g.add(s); } };
+      // a river beside the back straight: centred well outside the outer rail, running parallel to it
+      const backRiver = (gap, wid) => { const p = course.at(post - course.circ*0.5, 45 + gap + wid/2); water(p, Math.max(bbx.w, bbx.h)*1.6, wid, p.th); };
+      if(L === "ascotperth") backRiver(60, 180);                           // the Swan River
+      if(L === "shatin") backRiver(70, 140);                               // Shing Mun River
+      if(L === "warwickfarm") backRiver(50, 70);                           // Georges River
+      if(L === "longchamp"){ backRiver(90, 140);                           // the Seine...
+        const e = far(2600, 900); const leg = new THREE.Mesh(new THREE.ConeGeometry(60, 300, 4, 1, true), M(0x5b4a3a)); leg.position.set(e.x, 150, e.z); g.add(leg); }   // ...and the Eiffel Tower
+      if(L === "gavea"){ const m = far(1500, 300); mountain(m, 420, 700, 0x2f5a34);   // Corcovado
+        const st = new THREE.Mesh(new THREE.BoxGeometry(10, 60, 10), M(0xe8e4dc)); st.position.set(m.x, 720, m.z); g.add(st);
+        const arms = new THREE.Mesh(new THREE.BoxGeometry(56, 9, 9), M(0xe8e4dc)); arms.position.set(m.x, 735, m.z); arms.rotation.y = rot; g.add(arms);
+        water(far(1300, -900), 1400, 500, sideHead); }                           // Rodrigo de Freitas lagoon
+      if(L === "tokyo") mountain(far(5200, -1800), 2200, 1500, 0x5a6878, true);       // Mt Fuji on a clear day
+      if(L === "meydan"){ const b = far(3800, 1200); tower(b, 520, 40, 0xb9c3cc, 300); tower(b.clone().add(new THREE.Vector3(60,0,40)), 300, 60, 0xb9c3cc); }   // Burj Khalifa
+      if(L === "kingabdulaziz") tower(far(3000, -600), 300, 46, 0x9aa6b0, 0);         // Kingdom Centre
+      if(L === "santaanita" || L === "riccarton") for(let i=-4;i<=4;i++) mountain(far(2600 + Math.abs(i)*140, i*700), 700, 900 + (i%2)*260, 0x6a6f78, L === "riccarton");  // San Gabriels / Southern Alps
+      if(L === "york"){ const y = far(2200, 500); tower(y, 70, 90, 0xc9b892); tower(y.clone().add(new THREE.Vector3(0,0,0)), 110, 26, 0xc9b892, 0); }     // York Minster
+      if(L === "greyville"){ const a = new THREE.Mesh(new THREE.TorusGeometry(180, 6, 6, 40, Math.PI), M(0xf0f0f0)); const p = far(1800, -700); a.position.set(p.x, 0, p.z); a.rotation.y = rot; g.add(a); }   // Moses Mabhida arch
+      if(L === "deauville") water(far(1800 + 1300, 0), 9000, 2600, sideHead);                    // the Channel
+      if(L === "chantilly"){ const p = far(900, 400); const ch = new THREE.Mesh(new THREE.BoxGeometry(160, 30, 46), M(0xe6dcc6)); ch.position.set(p.x, 15, p.z); ch.rotation.y = rot; g.add(ch);
+        for(const dx of [-70, 70]){ const tw = new THREE.Mesh(new THREE.CylinderGeometry(12, 12, 46, 10), M(0xe6dcc6)); tw.position.set(p.x + Math.cos(rot)*dx, 23, p.z - Math.sin(rot)*dx); g.add(tw);
+          const rf = new THREE.Mesh(new THREE.ConeGeometry(14, 22, 10), M(0x4a5560)); rf.position.set(p.x + Math.cos(rot)*dx, 57, p.z - Math.sin(rot)*dx); g.add(rf); } }   // the château
+      if(L === "kyoto"){ const p = far(1600, 600); for(let i=0;i<5;i++){ const lv = new THREE.Mesh(new THREE.BoxGeometry(40 - i*5, 9, 40 - i*5), M(0x6b3a2a)); lv.position.set(p.x, 5 + i*11, p.z); g.add(lv);
+          const ro = new THREE.Mesh(new THREE.BoxGeometry(50 - i*5, 2, 50 - i*5), M(0x2b2b2b)); ro.position.set(p.x, 10 + i*11, p.z); g.add(ro); } }   // To-ji pagoda
+      if(L === "churchill"){ const p = course.at(post + 40, 95); for(const dx of [-14, 14]){ const sp = new THREE.Mesh(new THREE.ConeGeometry(5, 34, 6), M(0xf2f0ea)); sp.position.set(p.x + side.x*dx, 62, p.z + side.z*dx); g.add(sp);
+          const base = new THREE.Mesh(new THREE.BoxGeometry(9, 14, 9), M(0xf2f0ea)); base.position.set(p.x + side.x*dx, 40, p.z + side.z*dx); g.add(base); } }   // the Twin Spires
+    } catch(e){}
+
     if(vc.carpark){
       const cars = [], cs = [], pal = [0xd9dcdf,0x2a2e35,0x7d8792,0x9b2335,0x2b3f6b,0xf1efe8];
       for(let i=0;i<260;i++){
@@ -5527,6 +5620,12 @@ const Renderer3D = (function(){
       // Sha Tin is ringed by residential towers standing right over the track.
       skyline(52, 85, 205, R+320, R+820, [20,34], towerMat);
       skyline(30, 10, 22, R+220, R+400, [14,26], lowMat, TAU);
+    } else if(kind === "megacity"){
+      // Happy Valley: a wall of lit towers standing almost on the outside rail,
+      // with taller blocks climbing the hills behind.
+      skyline(150, 70, 190, R+170, R+420, [16,28], towerMat, TAU);
+      skyline(80, 110, 260, R+420, R+800, [18,32], towerMat, TAU);
+      skyline(40, 140, 320, R+800, R+1300, [20,36], towerMat, TAU);
     } else if(kind === "suburb"){
       skyline(150, 5, 10, R+220, R+760, [10,20], lowMat, TAU);
       skyline(9, 40, 100, R+950, R+1500, [18,30], towerMat, 0.5);
@@ -14301,7 +14400,159 @@ function setupControls(){
 </script>
 <script>
 // ============================================================================
-//  FURLONG WORLD CHAMPIONSHIP  ·  career mode v37
+//  v38: track data pass. Corrections to existing venues (Flemington untouched)
+//  and twenty-two new venues around the world, each with a feature race.
+// ============================================================================
+(function f27Tracks(){
+  // ---- corrections from the reference package (circumference / straight) -----
+  const FIX = {
+    eaglefarm:{ circ:2027, home:434 }, sandown:{ circ:1891, home:407 }, morphettville:{ circ:2307, home:334 },
+    ascotperth:{ circ:2020, home:300 }, doomben:{ circ:1715, home:320 }, warwickfarm:{ circ:1937, home:326 },
+    goldcoast:{ circ:1885, home:400 }, shatin:{ circ:1899, home:430 },
+  };
+  const bend = (c, h) => Math.round(Math.max(120, Math.min(300, (c - 2*h) / (2*Math.PI))));
+  for(const [k, f] of Object.entries(FIX)) if(TRACKS[k]){ Object.assign(TRACKS[k], f); TRACKS[k].bendR = bend(f.circ, f.home); }
+
+  Object.assign(PLACES, {
+    Paris:[48.86,2.25], Fuchu:[35.67,139.48], Dubai:[25.16,55.30], Louisville:[38.20,-85.77], Surrey:[51.31,-0.26],
+    Perth:[-31.93,115.92], Adelaide:[-34.95,138.53], Bundall:[-28.02,153.41], Elmont:[40.71,-73.72], Saratoga:[43.08,-73.77],
+    Lexington:[38.05,-84.61], Arcadia:[34.14,-118.04], Riyadh:[24.73,46.62], Kyoto:[34.91,135.72], Funabashi:[35.73,139.96],
+    Newmarket:[52.24,0.37], York:[53.94,-1.09], Chichester:[50.89,-0.75], Kildare:[53.16,-6.84], Dublin:[53.27,-6.20],
+    Chantilly:[49.19,2.48], Deauville:[49.35,0.07], "Baden-Baden":[48.79,8.17], Auckland:[-36.89,174.79], Christchurch:[-43.55,172.58],
+    Rio:[-22.97,-43.22], "Buenos Aires":[-34.57,-58.42], Durban:[-29.85,31.01], Singapore:[1.42,103.76], "Hong Kong":[22.27,114.18],
+  });
+
+  // name, key, city, country, hand, circ, home, surface, sky, surround, trees, hills, lights, straightCourse, chutes, note, stands, infield
+  const T = (o)=>o;
+  const NEW = [
+    T({ k:"happyvalley", name:"Happy Valley", city:"Hong Kong", st:"HKG", hand:"right", circ:1450, home:310, surf:"turf", sky:"night", sur:"towers", tr:"fig", hills:true, lights:true, chutes:[1000,1200,1650,1800,2200],
+      note:"Wednesday nights under the lights, with skyscrapers on every side. The tightest top-class track in the world: lead, hug the fence and pray.", stands:[["tier",1.10,"Happy Valley Stand"],["tier",0.9,"Members"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"saratoga", name:"Saratoga", city:"Saratoga", st:"USA", hand:"left", circ:1810, home:350, surf:"dirt", sky:"day", sur:"woodland", tr:"oak", hills:false, lights:false, chutes:[1400,1600,1800,2000],
+      note:"The Spa: a summer meeting under the elms, striped awnings and a crowd that has come every August for a hundred and fifty years. The Graveyard of Favourites.", stands:[["tier",0.9,"Clubhouse"],["tier",0.85,"Grandstand"],["lawn",0.18,"Backyard"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"belmont", name:"Belmont Park", city:"Elmont", st:"USA", hand:"left", circ:2414, home:334, surf:"dirt", sky:"day", sur:"suburb", tr:"oak", hills:false, lights:true, chutes:[1400,1600,1800,2000,2400],
+      note:"Big Sandy: a mile and a half of dirt, the widest bends in America and the Test of the Champion at the end of the Triple Crown.", stands:[["tier",1.15,"Grandstand"],["tier",0.95,"Clubhouse"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"keeneland", name:"Keeneland", city:"Lexington", st:"USA", hand:"left", circ:1710, home:377, surf:"dirt", sky:"day", sur:"woodland", tr:"oak", hills:true, lights:false, chutes:[1400,1700,1800],
+      note:"Limestone walls, bluegrass paddocks and the sales ring next door. Kentucky racing as it looks on the postcards.", stands:[["tier",0.85,"Grandstand"],["lawn",0.18,"Paddock Lawn"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"santaanita", name:"Santa Anita", city:"Arcadia", st:"USA", hand:"left", circ:1609, home:274, surf:"dirt", sky:"warm", sur:"tropical", tr:"palm", hills:true, lights:false, chutes:[1200,1400,1800,2000],
+      note:"Art deco stands, palm trees and the San Gabriel Mountains filling the whole sky behind the backstretch.", stands:[["tier",1.0,"Grandstand"],["tier",0.85,"Clubhouse"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"kingabdulaziz", name:"King Abdulaziz", city:"Riyadh", st:"KSA", hand:"left", circ:2040, home:400, surf:"dirt", sky:"night", sur:"towers", tr:"palm", hills:false, lights:true, chutes:[1200,1600,1800,2100,3000],
+      note:"Desert racing under floodlights for the richest purse on earth. A wide, fair dirt oval with nowhere to hide.", stands:[["tier",1.05,"Royal Stand"],["tier",0.9,"Grandstand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"kyoto", name:"Kyoto", city:"Kyoto", st:"JPN", hand:"right", circ:1894, home:404, surf:"turf", sky:"day", sur:"suburb", tr:"fig", hills:true, lights:false, chutes:[1600,2000,2200,3000,3200],
+      note:"The hill on the third bend: up, then down into the straight. Lap the lake in the infield and it decides the Tenno Sho.", stands:[["tier",1.05,"Grand Swan"],["tier",0.85,"Stand"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"nakayama", name:"Nakayama", city:"Funabashi", st:"JPN", hand:"right", circ:1667, home:310, surf:"turf", sky:"overcast", sur:"suburb", tr:"fig", hills:true, lights:false, chutes:[1200,1600,2000,2200,2500],
+      note:"Tight, hilly and steep at the finish, with the shortest straight on the JRA circuit. The Arima Kinen is a fan-voted all-star race here every Christmas.", stands:[["tier",1.0,"Stand"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"newmarket", name:"Newmarket", city:"Newmarket", st:"GBR", hand:"right", circ:3600, home:600, surf:"turf", sky:"overcast", sur:"woodland", tr:"oak", hills:false, lights:false, sc:2012, chutes:[1000,1200,1400,1600,2000,3600],
+      note:"The Rowley Mile: a mile and a quarter dead straight across open heath, a drop into the Dip and a climb to the line. Headquarters.", stands:[["tier",1.0,"Millennium Grandstand"],["lawn",0.2,"The Heath"]], inf:{ lake:false, screen:true, yard:false } }),
+    T({ k:"york", name:"York", city:"York", st:"GBR", hand:"left", circ:3200, home:900, surf:"turf", sky:"overcast", sur:"suburb", tr:"oak", hills:false, lights:false, chutes:[1000,1200,1600,2050,2800],
+      note:"The Knavesmire: flat, wide and fair, with a long horseshoe and a five-furlong straight. The Ebor and the Juddmonte International.", stands:[["tier",1.0,"Ebor Stand"],["tier",0.9,"County Stand"],["lawn",0.18,"Knavesmire"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"goodwood", name:"Goodwood", city:"Chichester", st:"GBR", hand:"right", circ:2400, home:800, surf:"turf", sky:"day", sur:"woodland", tr:"oak", hills:true, lights:false, sc:1200, chutes:[1200,1400,1600,2000,2400],
+      note:"Glorious Goodwood: high on the South Downs, all switchback undulations and Panama hats. The track drops and twists towards the sea.", stands:[["tier",0.95,"March Stand"],["tier",0.8,"Sussex Stand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"curragh", name:"The Curragh", city:"Kildare", st:"IRL", hand:"right", circ:3200, home:600, surf:"turf", sky:"overcast", sur:"woodland", tr:"oak", hills:false, lights:false, sc:1600, chutes:[1000,1400,1600,2000,2400,2800],
+      note:"A great horseshoe on open plain, sheep grazing the gorse, and a straight mile. Every Irish Classic is run here.", stands:[["tier",1.0,"Grandstand"],["lawn",0.2,"The Plain"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"leopardstown", name:"Leopardstown", city:"Dublin", st:"IRL", hand:"left", circ:2200, home:450, surf:"turf", sky:"overcast", sur:"suburb", tr:"oak", hills:true, lights:true, chutes:[1400,1600,2000,2400],
+      note:"Dublin's track, with the mountains behind. A sharp turn for home and the Irish Champion Stakes: often the best race of the year.", stands:[["tier",1.0,"Grandstand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"chantilly", name:"Chantilly", city:"Chantilly", st:"FRA", hand:"right", circ:2400, home:600, surf:"turf", sky:"day", sur:"woodland", tr:"oak", hills:false, lights:false, chutes:[1600,2000,2100,2400],
+      note:"Racing in front of a ch\u00e2teau and the Great Stables, with forest all round. The Prix du Jockey Club and the Diane.", stands:[["tier",0.8,"Grandstand"],["lawn",0.2,"Pelouse"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"deauville", name:"Deauville", city:"Deauville", st:"FRA", hand:"right", circ:2000, home:450, surf:"turf", sky:"day", sur:"suburb", tr:"oak", hills:false, lights:true, sc:1600, chutes:[1200,1600,2000],
+      note:"August by the sea in Normandy. A flat course with a straight mile, and the whole of French racing on holiday.", stands:[["tier",0.85,"Grandstand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"badenbaden", name:"Baden-Baden", city:"Baden-Baden", st:"GER", hand:"left", circ:2000, home:500, surf:"turf", sky:"day", sur:"woodland", tr:"oak", hills:true, lights:false, chutes:[1400,1600,2000,2400],
+      note:"Iffezheim, under the Black Forest. A spa-town meeting in late summer and the Grosser Preis von Baden.", stands:[["tier",0.85,"Grandstand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"ellerslie", name:"Ellerslie", city:"Auckland", st:"NZL", hand:"right", circ:1900, home:380, surf:"turf", sky:"day", sur:"suburb", tr:"fig", hills:true, lights:false, chutes:[1200,1600,2100,2400,3200],
+      note:"Auckland's headquarters, with a stiff rise to the line. The New Zealand Derby and the Karaka Million.", stands:[["tier",0.95,"Grandstand"],["lawn",0.2,"The Hill"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"riccarton", name:"Riccarton Park", city:"Christchurch", st:"NZL", hand:"left", circ:2000, home:400, surf:"turf", sky:"day", sur:"suburb", tr:"eucalypt", hills:true, lights:false, chutes:[1200,1600,2000,3200],
+      note:"Flat and fair, with the Southern Alps on the horizon. Cup Week every November.", stands:[["tier",0.85,"Grandstand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"gavea", name:"G\u00e1vea", city:"Rio", st:"BRA", hand:"left", circ:2200, home:450, surf:"turf", sky:"warm", sur:"city", tr:"palm", hills:true, lights:true, chutes:[1600,2000,2400],
+      note:"Racing beside the lagoon in Rio, with Corcovado and Christ the Redeemer standing over the back straight.", stands:[["tier",1.0,"Tribuna Social"]], inf:{ lake:true, screen:true, yard:true } }),
+    T({ k:"palermo", name:"Palermo", city:"Buenos Aires", st:"ARG", hand:"right", circ:2400, home:550, surf:"dirt", sky:"day", sur:"city", tr:"fig", hills:false, lights:true, chutes:[1600,2000,2500],
+      note:"The big sand course in the middle of Buenos Aires, with a belle \u00e9poque grandstand and a straight of a thousand metres.", stands:[["tier",1.0,"Tribuna Oficial"],["tier",0.8,"Tribuna Paddock"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"greyville", name:"Greyville", city:"Durban", st:"RSA", hand:"right", circ:2800, home:450, surf:"turf", sky:"warm", sur:"city", tr:"palm", hills:false, lights:true, chutes:[1600,2000,2200],
+      note:"A racecourse with a golf course in the middle and the Durban skyline behind. Home of the Durban July, the biggest party in African racing.", stands:[["tier",1.0,"Grandstand"]], inf:{ lake:false, screen:true, yard:true } }),
+    T({ k:"kranji", name:"Kranji", city:"Singapore", st:"SGP", hand:"left", circ:2000, home:400, surf:"turf", sky:"night", sur:"tropical", tr:"palm", hills:false, lights:true, chutes:[1200,1600,2000],
+      note:"Modern stands and a tropical night meeting. Singapore's track ran its last race in 2024; here it lives on.", stands:[["tier",1.0,"Grandstand"]], inf:{ lake:true, screen:true, yard:true } }),
+  ];
+  const SEAT = ["#3a3f4c","#33384a","#414654","#3b4452"];
+  NEW.forEach((n, i)=>{
+    const dirt = n.surf === "dirt";
+    const stands = [];
+    let x = -560;
+    n.stands.forEach(([type, h, name], j)=>{
+      const w = type === "lawn" ? 340 : (j === 0 ? 420 : 320);
+      stands.push(type === "lawn"
+        ? { from:-1060, to:-720, type:"lawn", h, depth:0.6, colour:"#3a8047", name }
+        : { from:x, to:x + w, type:"tier", h, depth:0.95 + h*0.2, colour:["#3b4452","#4a4f5e","#524a3a"][j % 3], roof:"cantilever", name });
+      if(type !== "lawn") x += w;
+    });
+    TRACKS[n.k] = {
+      name:n.name, club:n.name + (dirt ? " Racing Association" : " Racecourse"), city:n.city, state:n.st,
+      region:"INTL", hand:n.hand, circ:n.circ, home:n.home, bendR:bend(n.circ, Math.min(n.home, n.circ*0.3)), surface:n.surf,
+      maxField:dirt ? 14 : 16, straightCourse:n.sc || 0, lights:!!n.lights, chutes:n.chutes,
+      grass:dirt ? "#8d6c45" : "#43914e", stripe:dirt ? "#98754c" : "#58aa62", note:n.note,
+      venue:{ sky:n.sky, seat:SEAT[i % 4], concrete:"#e8e2d2", lightTowers:n.lights ? 6 : 0, surround:n.sur, trees:n.tr, hills:!!n.hills,
+        skyDir:2 + (i % 5)*0.6, skyArc:1.5, stands, infield:Object.assign({ roses:false }, n.inf), marquees:6 },
+    };
+  });
+
+  // ---- a feature race at every new venue ------------------------------------------
+  const R = (w, n, t, d, p, cls, g, blurb) => ({ w, n, t, d, g:g || "G1", p, cls, c:{minAge:3}, wfa:true, intl:true, blurb });
+  const RACES = [
+    R(3,  "Travers Stakes", "saratoga", 2000, 1250000, 110, "G1", "The Midsummer Derby at the Spa, for three-year-olds on the dirt."),
+    R(3,  "Juddmonte International", "york", 2050, 1500000, 113, "G1", "Ten and a half furlongs on the Knavesmire, and usually the best middle-distance race of the summer."),
+    R(5,  "Grosser Preis von Baden", "badenbaden", 2400, 500000, 108, "G1", "Germany's championship race under the Black Forest."),
+    R(7,  "Irish Champion Stakes", "leopardstown", 2000, 1500000, 113, "G1", "Leopardstown in September: often the best race run anywhere all year."),
+    R(15, "New Zealand Cup", "riccarton", 3200, 400000, 98, "G3", "Two miles at Riccarton in Cup Week, with the Alps on the skyline."),
+    R(16, "Singapore Gold Cup", "kranji", 2000, 1300000, 104, "G1", "A night race under the Kranji lights."),
+    R(16, "Gran Premio Nacional", "palermo", 2500, 500000, 104, "G1", "Argentina's Derby, on the sand at Palermo."),
+    R(19, "Happy Valley Gold Cup", "happyvalley", 1800, 1800000, 104, "G2", "Wednesday night under the skyscrapers. Tight, fast and loud."),
+    R(21, "Arima Kinen", "nakayama", 2500, 6000000, 112, "G1", "The Grand Prix: Japan's all-star race, its runners voted in by the fans, run two days before Christmas."),
+    R(27, "New Zealand Derby", "ellerslie", 2400, 1000000, 100, "G1", "The Classic of the southern summer at Ellerslie."),
+    R(29, "Saudi Cup", "kingabdulaziz", 1800, 20000000, 114, "G1", "Twenty million dollars under the Riyadh floodlights. One of the richest races on earth."),
+    R(31, "Santa Anita Handicap", "santaanita", 2000, 1000000, 108, "G1", "The Big 'Cap, with the San Gabriel Mountains watching."),
+    R(37, "Blue Grass Stakes", "keeneland", 1800, 1000000, 106, "G1", "The last big Kentucky Derby trial, at the prettiest track in America."),
+    R(39, "Tenno Sho (Spring)", "kyoto", 3200, 5500000, 110, "G1", "The Emperor's Cup over two miles, twice up and over the Kyoto hill."),
+    R(40, "2000 Guineas", "newmarket", 1600, 1000000, 110, "G1", "The first Classic, a dead-straight mile across the Heath."),
+    R(45, "Belmont Stakes", "belmont", 2400, 2000000, 110, "G1", "The Test of the Champion: a mile and a half, the last leg of the Triple Crown."),
+    R(45, "Prix du Jockey Club", "chantilly", 2100, 2000000, 110, "G1", "The French Derby, in front of the ch\u00e2teau."),
+    R(47, "Irish Derby", "curragh", 2400, 1500000, 110, "G1", "Twelve furlongs on the plain of Kildare."),
+    R(49, "Durban July", "greyville", 2200, 800000, 102, "G1", "Africa's greatest race day, with fifty thousand people in their finest."),
+    R(49, "Grande Pr\u00eamio Brasil", "gavea", 2400, 600000, 102, "G1", "Rio's great race, under Christ the Redeemer."),
+    R(52, "Sussex Stakes", "goodwood", 1600, 1500000, 112, "G1", "The midsummer mile on the Downs at Glorious Goodwood."),
+    R(2,  "Prix Jacques le Marois", "deauville", 1600, 1500000, 110, "G1", "The straight mile by the sea at Deauville."),
+  ];
+  RACES.forEach(r=>{ if(CALENDAR.some(x=>x.n === r.n)) return; CALENDAR.push(r); (CAL_BY_WEEK[r.w] = CAL_BY_WEEK[r.w] || []).push(r); });
+  // the Race Day picker reads this list, which was built before these venues existed
+  for(const k of Object.keys(TRACKS)) if(!TRACK_KEYS.includes(k)) TRACK_KEYS.push(k);
+})();
+
+
+// ---- v39: course outlines traced from the real maps (Flemington untouched) ------
+(function f27Outlines(){
+  const P = (...a) => ({ kind:"path", segs:a.map(x=>Array.isArray(x) ? { t:x[0], r:x[1] } : { s:x }) });
+  const SH = {
+    caulfield:  P(367, [95,160], 560, [150,105], 520, [115,165]),          // the triangle
+    warwickfarm:P(326, [112,150], 500, [138,115], 470, [110,150]),         // rounded triangle
+    ascotuk:    P(503, [128,165], 700, [104,150], 640, [128,180]),         // Swinley Bottom triangle
+    ascotperth: P(300, [192,205], 520, [168,105]),                         // pear: wide end first
+    curragh:    P(600, [150,210], 720, [62,300], 600, [148,200]),          // horseshoe on the plain
+  };
+  for(const [k, sh] of Object.entries(SH)) if(TRACKS[k] && k !== "flemington") TRACKS[k].shape = sh;
+  if(TRACKS.longchamp) TRACKS.longchamp.shape = { kind:"egg", ratio:0.52, runout:80 };
+})();
+
+
+// ---- v41: environment QA against the aerial photos (Flemington untouched) -------
+(function f27EnvQA(){
+  const set = (k, v, inf) => { const t = TRACKS[k]; if(!t || k === "flemington") return; Object.assign(t.venue, v || {}); if(inf) Object.assign(t.venue.infield, inf); };
+  set("happyvalley", { surround:"megacity", sky:"night", hills:true, trees:"fig", lightTowers:8 });
+  set("caulfield", null, { lake:true });                                  // the two infield ponds
+  set("doomben", null, { lake:true });                                    // the chain of infield ponds
+  set("morphettville", null, { lake:true });                              // the big central lake
+  set("warwickfarm", { surround:"woodland", trees:"eucalypt" }, { lake:true }); // Georges River bushland, infield dam
+  set("kingabdulaziz", { surround:"tropical", trees:"palm" }, { lake:true });   // desert edge, landscaped infield lakes
+  set("ascotperth", { trees:"eucalypt" });                                // Swan River side, not palms
+})();
+
+// ============================================================================
+//  FURLONG WORLD CHAMPIONSHIP  ·  career mode v47
 //  Story campaign (three books), global points championship, executive suite,
 //  business ventures, and the jockey room with its own academy.
 // ============================================================================
@@ -14425,12 +14676,12 @@ function fwcMarquee(r){ return false; }
 function fwcLicensed(C){ return !!(C && C.fwc && (C.fwc.licence || 0) >= C.year); }
 function fwcInstallFinal(){
   if(FWC_FINAL) return FWC_FINAL;
-  let no = 0;
-  CALENDAR.filter(r=>FWC_MAJORS.includes(r.n)).sort((a,b)=>a.w - b.w).forEach(r=>{
-    r.g = "WC"; r.wc = true; r.round = ++no; r.elite = false;
-    r.p = Math.round(Math.max(r.p, 5000000) * 1.25 / 100000) * 100000; r.cls = (r.cls || 108) + 3;
-    r.blurb = `World Championship Round ${no}. ` + (r.blurb || "One of the majors, and points to tenth.");
+  // Every race that can host a major remembers what it is in a normal year.
+  CALENDAR.filter(r=>FWC_FIXED.includes(r.n) || FWC_ROTATE.includes(r.n)).forEach(r=>{
+    r._fwcPool = true;
+    r._orig = { g:r.g, p:r.p, cls:r.cls, c:r.c, setwt:r.setwt, hcp:r.hcp, wfa:r.wfa, elite:r.elite, blurb:r.blurb };
   });
+  const no = 11;
   FWC_FINAL = { w:FWC_FINAL_WEEK, n:"Furlong World Championship Final", t:"flemington", d:2000, g:"WC", p:30000000, cls:116, round:no + 1,
     c:{minAge:3}, wfa:true, big:true, fwcFinal:true,
     blurb:"Ten stables, qualified on points across the Championship Rounds. Thirty million dollars and quadruple points: the Final can change everything, and the champion is only crowned once it is run." };
@@ -14441,6 +14692,49 @@ function fwcInstallFinal(){
 function fwcSyncFinal(C){
   const f = fwcInstallFinal();
   f.t = "flemington"; f.d = 2000; f.intl = false; f.city = "Melbourne";
+  if(C && C.fwc) fwcApplyMajors(fwcSeasonMajors(C));
+}
+// ---- the majors rotate (v45): six fixtures every season, five more drawn from the pool
+const FWC_FIXED = ["The Everest","Prix de l'Arc de Triomphe","Melbourne Cup","Japan Cup","Dubai World Cup","Kentucky Derby"];
+const FWC_ROTATE = ["Hong Kong Cup","All-Star Mile","Queen Elizabeth Stakes","Epsom Derby","King George VI & Queen Elizabeth Stakes",
+  "Saudi Cup","Belmont Stakes","Irish Champion Stakes","Juddmonte International","Arima Kinen","Tenno Sho (Spring)","Prix du Jockey Club",
+  "New Zealand Derby","New Zealand Cup","Happy Valley Gold Cup"];
+function fwcSeasonMajors(C){
+  const F = C.fwc; F.majors = F.majors || {};
+  if(!F.majors[C.year]){
+    let seed = [...String(C.trainer || "x") + C.year].reduce((n,c)=>(n*31 + c.charCodeAt(0))>>>0, 7);
+    const rnd = () => { seed ^= seed << 13; seed >>>= 0; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0; return seed / 4294967296; };
+    for(let k=0;k<8;k++) rnd();
+    const avail = FWC_ROTATE.filter(n=>CALENDAR.some(r=>r.n === n));
+    const pickd = [];
+    while(pickd.length < 5 && avail.length) pickd.push(avail.splice(Math.floor(rnd()*avail.length), 1)[0]);
+    F.majors[C.year] = FWC_FIXED.concat(pickd);
+  }
+  return F.majors[C.year];
+}
+let FWC_APPLIED = "";
+function fwcApplyMajors(names){
+  const key = names.join("|"); if(key === FWC_APPLIED) return; FWC_APPLIED = key;
+  // clear last season's support cards
+  for(let i = CALENDAR.length - 1; i >= 0; i--) if(CALENDAR[i].support) CALENDAR.splice(i, 1);
+  for(const w of Object.keys(CAL_BY_WEEK)) CAL_BY_WEEK[w] = CAL_BY_WEEK[w].filter(r=>!r.support);
+  let no = 0;
+  CALENDAR.filter(r=>r._fwcPool).sort((a,b)=>a.w - b.w).forEach(r=>{
+    Object.assign(r, r._orig); delete r.wc; delete r.round;
+    if(!names.includes(r.n)) return;
+    r.g = "WC"; r.wc = true; r.round = ++no; r.elite = false; r.c = {}; delete r.setwt; delete r.hcp; r.wfa = true;
+    r.p = Math.round(Math.max(r._orig.p, 5000000) * 1.25 / 100000) * 100000; r.cls = (r._orig.cls || 108) + 3;
+    r.blurb = `World Championship Round ${no}. ` + (r._orig.blurb || "One of the majors, and points to tenth.");
+    const sh = (typeof FWC_SHORT !== "undefined" && FWC_SHORT[r.n]) || r.n.replace(/ Stakes$/, "");
+    const sup = [
+      { w:r.w, n:`${sh} Challenger Stakes`, t:r.t, d:r.d, g:"G2", p:600000, cls:Math.max(84, r.cls - 14), c:{minAge:3}, wfa:true, support:r.n, challenger:true,
+        blurb:`The Challenger race on ${r.n} weekend. Win it and the Council grants your stable a World Championship licence.` },
+      { w:r.w, n:`${sh} Trophy`, t:r.t, d:r.d, g:"G3", p:300000, cls:Math.max(78, r.cls - 21), c:{minAge:3}, wfa:true, support:r.n,
+        blurb:`Support race on ${r.n} weekend, in front of the biggest crowd your horse will ever see.` },
+    ];
+    for(const x of sup){ CALENDAR.push(x); (CAL_BY_WEEK[x.w] = CAL_BY_WEEK[x.w] || []).push(x); }
+  });
+  if(FWC_FINAL) FWC_FINAL.round = no + 1;
 }
 function fwcQualify(C){
   const F = fwcEnsure(C), rank = fwcRank(C);
@@ -14529,7 +14823,7 @@ function fwcCrown(C, y){
   } else {
     feed(C, `${champ.n} are the ${y}/${String(y+1).slice(2)} Furlong World Champions. You finished ${ordinal(pos)}${bonus ? ` and collect ${fmtMoney(bonus)} from the bonus pool` : ""}.`, pos <= 3 ? "good" : "");
   }
-  fwcQueue(C, "crown");
+  if(F.storyLive) fwcQueue(C, "crown");      // unlicensed stables just read about it in the feed
 }
 // ---- the story --------------------------------------------------------------
 const fwcFn = C => String(C.trainer || "you").split(" ")[0];
@@ -14600,11 +14894,16 @@ const FWC_SCENES = {
   intro_c1: C=>({ card:{ book:1, ch:1, t:"The Announcement" }, lines:[
     ["narr", "Monday, a quarter to seven. The Furlong World Racing Council has called a press conference in Dubai, and every trainer on the planet has a television on in the feed room."],
     ["vance", "For a hundred and fifty years this sport has crowned its champions one race at a time. A Cup here. A Derby there. Today that ends."],
+    ["globe", null],
     ["vance", "From this season, the best stables on earth will race for a single title. Eleven majors on four continents \u2014 the Everest, the Arc, the Melbourne Cup, the Japan Cup, Kentucky, Epsom, Dubai \u2014 lifted above every other race on the calendar. Points to tenth in each."],
     ["vance", "You cannot buy your way in. A stable earns its licence the old way: by winning a Group One. And the ten best stables in the world meet in a Final at Flemington, for thirty million dollars."],
     ["vance", "Ladies and gentlemen \u2014 the Furlong World Championship."],
     ["narr", "Behind her on the dais, a man in a charcoal suit starts applauding a beat before anyone else. Sterling Kade. Kade Meridian underwrote the prize fund. Everyone in the room knows exactly what that buys."],
-    ["mac", "You watching this? \u2026 Course you are."],
+    ["narr", "Every racing nation will be watching the majors. Most stables will never set foot in one. To race for the title, a stable must first win a Group One."],
+  ]}),
+  story_start: C=>({ card:{ book:1, ch:1, t:"A Licence and a Letter" }, lines:[
+    ["narr", `The licence letter arrives on Council letterhead. ${coN(C)} is in the World Championship. Then the phone rings.`],
+    ["mac", "So. You're in. Licensed for the majors \u2026 I had a feeling you'd ring me before the ink was dry."],
     ["mac", `Thirty years I spent trying to get a horse to Longchamp. Got there once, ran second by a nostril, never got another shot. They've just built you a ladder, ${fwcFn(C)}. Don't stand at the bottom admiring it.`],
     ["you", `Mac, I've got ${hn(C)}, a feed bill and a phone that doesn't ring. Kade Meridian has four hundred horses.`],
     ["mac", "Then stop thinking like a trainer with a horse and start thinking like a stable that wins things. Get people round you. Someone who can read a balance sheet. Someone who can ride. Do that, and I'll tell you the rest."],
@@ -14801,6 +15100,13 @@ function fwcQueue(C, id){ const F = fwcEnsure(C); if(!F.queue.includes(id)) F.qu
 function fwcChapter(C){ return FWC_CH[Math.min(C.fwc.ch, FWC_CH.length-1)]; }
 function fwcAdvanceStory(C){
   const F = fwcEnsure(C);
+  if(F.storyLive == null) F.storyLive = F.ch > 0 || (F.licence || 0) > 0;
+  if(!F.storyLive){
+    // The world hears the announcement; your own story waits for your first Group 1.
+    if(!F.seen.intro_c1 && !F.queue.includes("intro_c1")) fwcQueue(C, "intro_c1");
+    F.chStarted = 0;
+    return;
+  }
   // A new season skips anything left over from the last book.
   while(F.ch < FWC_CH.length - 1 && FWC_CH[F.ch].book < Math.min(4, fwcBook(C))){
     F.journal.unshift({ y:C.year, t:`Chapter ${FWC_CH[F.ch].n}, \u201c${FWC_CH[F.ch].t}\u201d, closed with the season.` });
@@ -15131,7 +15437,8 @@ function fwcPlay(replayId){
     } else if(i < lines.length){
       const [who, text] = lines[i];
       const cast = who === "you" ? fwcYou(C) : FWC_CAST[who] || FWC_CAST.narr;
-      if(who === "award"){ const a = text;
+      if(who === "globe") inner = fwcGlobe();
+      else if(who === "award"){ const a = text;
         inner = `<div class="fwc-award"><div class="bug">THE FURLONG AWARDS \u00b7 LIVE</div><h2>${esc(a.cat)}</h2>
           <div class="noms">${a.nominees.map(n=>`<span class="${n === a.winner ? "w" : ""}">${esc(n)}</span>`).join("")}</div>
           <div class="win"><small>AND THE WINNER IS</small><b>${esc(a.winner)}</b>${a.you ? "<em>YOUR STABLE</em>" : ""}</div></div>`; }
@@ -15199,7 +15506,7 @@ function fwcPaintPanel(C){
     <button class="btn sm ghost" id="fwcReplay">Replay scene</button>
   </div>
   <div class="fwc-cols">
-    <div><h4>Objectives</h4>${waiting ? nextCh : fwcObjHtml(C, ch)}
+    <div><h4>Objectives</h4>${!F.storyLive ? `<div class="fwc-obj"><i></i><div><b>Win a Group 1 to earn your World Championship licence</b><small>Your story begins the moment you qualify</small></div></div>` : waiting ? nextCh : fwcObjHtml(C, ch)}
       <h4 style="margin-top:14px">Upcoming Championship Rounds</h4><div class="fwc-rounds">${up.join("") || `<p class="note">No more rounds this season.</p>`}</div>
       <h4 style="margin-top:14px">Results</h4>${recent}</div>
     <div><h4>World Championship standings</h4><div class="fwc-tablewrap"><table class="fwc-table"><thead><tr><th>#</th><th>Stable</th><th>Pts</th><th>Gap</th></tr></thead><tbody>${rows}</tbody></table></div>
@@ -15461,6 +15768,13 @@ function fwcGrantLicence(C){
   const F = fwcEnsure(C), had = fwcLicensed(C);
   F.licence = Math.max(F.licence || 0, C.year + 1);
   if(!had){ feed(C, "A Group 1 winner: the Council has granted you a World Championship licence for this season and next. The majors are open to you.", "big"); fwcQueue(C, "licence"); }
+  if(!F.storyLive){
+    // your story starts now: book one begins this season
+    F.storyLive = true; F.startYear = C.year; F.ch = 0; F.chStarted = 0;
+    F.base = { wins:C.wins||0, g1:C.g1||0, stakes:C._stakesWins||0 };
+    fwcQueue(C, "story_start");
+    F.journal.unshift({ y:C.year, t:"Licensed. Your World Championship story begins." });
+  }
 }
 FWC_SCENES.licence = C=>({ card:{ book:Math.min(4, fwcBook(C)), ch:"\u2605", t:"Licensed" }, lines:[
   ["vance", `Congratulations. ${coN(C)} now holds a Furlong World Championship licence. Every major on the calendar is open to you.`],
@@ -15676,7 +15990,7 @@ const FWC_SHORT = { "The Everest":"Everest", "Prix de l'Arc de Triomphe":"Arc", 
       { w:r.w, n:`${sh} Trophy`, t:r.t, d:r.d, g:"G3", p:300000, cls:Math.max(78, (r.cls||110) - 21), c:{minAge:3}, wfa:true,
         support:r.n, blurb:`Support race on ${r.n} weekend, in front of the biggest crowd your horse will ever see.` },
     ];
-    if(!r.fwcFinal) for(const x of sup){ if(!CALENDAR.some(y=>y.n === x.n)){ CALENDAR.push(x); (CAL_BY_WEEK[x.w] = CAL_BY_WEEK[x.w] || []).push(x); } }
+    void sup;
   });
 })();
 
@@ -16042,7 +16356,7 @@ function fwcVenueChamps(venueKey){
     if(!was && C.fwc.lastCrown){
       if(C.fwc.lastCrown.you && C.horse){ const F = C.fwc; F.champHorses = F.champHorses || []; if(!F.champHorses.some(c=>c.name === C.horse.name && c.y === y)) F.champHorses.push({ name:C.horse.name, y });
         feed(C, `${C.horse.name}'s banner and statue go up at ${trk(C.base).name}, the stable's home track.`, "big"); }
-      fwcQueue(C, "awards");
+      if(C.fwc.storyLive) fwcQueue(C, "awards");
     }
     return r;
   };
@@ -16138,7 +16452,6 @@ FWC_SCENES.awards = C=>{
       <canvas id="spCanvas"></canvas><div class="sp-shade"></div><div class="sp-grain"></div>
       <div class="sp-press" id="spPress">
         <div class="sp-logo">${f27Logo("primary")}</div>
-        <div class="sp-tag">THE FURLONG WORLD CHAMPIONSHIP</div>
         <button class="sp-start" id="spStart">PRESS START</button>
         <div class="sp-legal">Fan project \u00b7 not affiliated with any racing authority \u00b7 horses, riders and owners are invented</div>
       </div>
@@ -16150,10 +16463,17 @@ FWC_SCENES.awards = C=>{
           <div class="sp-tiles" id="spTiles"></div>
           <div class="sp-hello" id="spHello"></div>
         </div>
-        <div class="sp-hints"><span><kbd>Enter</kbd> Select</span><span><kbd>\u2190 \u2192</kbd> Move</span><span><kbd>Esc</kbd> Back</span></div>
+        <div class="sp-hints"><button data-h="enter"><kbd>Enter</kbd> Select</button><button data-h="left"><kbd>\u2190</kbd></button><button data-h="right"><kbd>\u2192</kbd> Move</button><button data-h="esc"><kbd>Esc</kbd> Back</button></div>
       </div></div>`);
     document.getElementById("spStart").addEventListener("click", openMenu);
     document.querySelector("#f27Splash .sp-promo").addEventListener("click", ()=>go("career"));
+    document.querySelectorAll("#f27Splash .sp-hints [data-h]").forEach(b=>b.addEventListener("click", ()=>{
+      const h = b.dataset.h, av = avail();
+      if(h === "left"){ sel = Math.max(0, sel - 1); paintMenu(); }
+      else if(h === "right"){ sel = Math.min(av.length - 1, sel + 1); paintMenu(); }
+      else if(h === "enter") go(av[sel].k);
+      else { document.getElementById("spMenu").hidden = true; document.getElementById("spPress").hidden = false; }
+    }));
     document.addEventListener("keydown", e=>{
       if(app.screen !== "title" || document.querySelector("#modalLayer .scrim")) return;
       const menu = document.getElementById("spMenu");
@@ -16252,6 +16572,100 @@ FWC_SCENES.awards = C=>{
   document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState === "hidden") flush(); });
   setInterval(flush, 60000);
   const q = document.getElementById("hubQuit"); if(q) q.textContent = "Save & exit";
+})();
+
+
+// ---- v44: the launch animation, every major on the world map -------------------
+function fwcGlobe(){
+  const X = lon => (lon + 180) / 360 * 1000, Y = lat => (90 - lat) / 180 * 500;
+  const land = [
+    [[-168,65],[-140,70],[-95,72],[-60,55],[-75,40],[-80,25],[-97,18],[-110,23],[-125,40],[-150,58]],
+    [[-80,10],[-60,8],[-35,-7],[-40,-22],[-55,-35],[-70,-52],[-75,-15]],
+    [[-10,36],[0,44],[-5,48],[5,54],[10,58],[25,70],[40,65],[40,45],[25,36],[10,44]],
+    [[-17,15],[-5,35],[10,37],[32,31],[43,12],[51,11],[40,-15],[20,-35],[12,-5],[-8,5]],
+    [[40,45],[40,65],[80,75],[140,72],[170,65],[140,50],[122,30],[110,20],[100,5],[78,8],[60,25],[48,30]],
+    [[114,-22],[130,-12],[142,-11],[153,-27],[146,-39],[135,-34],[115,-34]],
+    [[130,32],[141,36],[142,44],[137,37]], [[-6,50],[2,51],[-3,58],[-6,55]],
+  ];
+  const rounds = CALENDAR.filter(r=>r.wc).sort((a,b)=>a.round - b.round).concat(FWC_FINAL ? [FWC_FINAL] : []);
+  // one pin per city, numbered; the names go in a legend under the map
+  const byCity = {};
+  rounds.forEach((r,i)=>{ const city = trk(r.t).city, p = PLACES[city] || PLACES.Melbourne;
+    (byCity[city] = byCity[city] || { x:X(p[1]), y:Y(p[0]), list:[], first:i }).list.push({ r, i }); });
+  const pins = Object.values(byCity);
+  const path = rounds.map((r,i)=>{ const p = byCity[trk(r.t).city]; return `${i ? "L" : "M"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`; }).join(" ");
+  const step = 0.55;
+  const tag = r => r.fwcFinal ? "F" : String(r.round);
+  return `<div class="fwc-globe"><div class="bug">THE FURLONG WORLD CHAMPIONSHIP \u00b7 ${rounds.length} ROUNDS THIS SEASON</div>
+    <svg viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet">
+      <defs><radialGradient id="gl" cx="50%" cy="50%" r="60%"><stop offset="0" stop-color="#16302a"/><stop offset="1" stop-color="#05080a"/></radialGradient></defs>
+      <rect width="1000" height="500" fill="url(#gl)"/>
+      ${[...Array(11)].map((_,k)=>`<line x1="0" x2="1000" y1="${k*50}" y2="${k*50}" stroke="#c79a3e" stroke-opacity=".07"/>`).join("")}
+      ${[...Array(21)].map((_,k)=>`<line y1="0" y2="500" x1="${k*50}" x2="${k*50}" stroke="#c79a3e" stroke-opacity=".07"/>`).join("")}
+      ${land.map(poly=>`<polygon points="${poly.map(([lo,la])=>`${X(lo).toFixed(1)},${Y(la).toFixed(1)}`).join(" ")}" fill="#2c4a3c" fill-opacity=".85" stroke="#4f7a62" stroke-width="1" stroke-linejoin="round"/>`).join("")}
+      <path d="${path}" fill="none" stroke="#e8c15a" stroke-width="1.4" stroke-opacity=".7" stroke-dasharray="5 6" class="fwc-route" style="animation-duration:${(rounds.length*step).toFixed(1)}s"/>
+      ${pins.map(p=>{ const fin = p.list.some(x=>x.r.fwcFinal), lbl = p.list.map(x=>tag(x.r)).join(" \u00b7 "), w = 14 + lbl.length*7;
+        return `<g class="fwc-pin" style="animation-delay:${(p.first*step).toFixed(2)}s">
+          <circle cx="${p.x}" cy="${p.y}" r="16" fill="none" stroke="#e8c15a" class="fwc-ping"/>
+          <circle cx="${p.x}" cy="${p.y}" r="${fin ? 8 : 6}" fill="${fin ? "#e8c15a" : "#f4f1ea"}"/>
+          <rect x="${p.x - w/2}" y="${p.y - 31}" width="${w}" height="18" rx="9" fill="#0b0f0d" stroke="#e8c15a" stroke-opacity=".7"/>
+          <text x="${p.x}" y="${p.y - 18}" text-anchor="middle" fill="#f4f1ea" font-size="11" font-weight="800">${lbl}</text></g>`; }).join("")}
+    </svg>
+    <div class="fwc-glist">${rounds.map((r,i)=>`<div class="fwc-pin" style="animation-delay:${(i*step).toFixed(2)}s"><b>${r.fwcFinal ? "FINAL" : "R" + r.round}</b><span>${esc(r.n)}</span><em>${esc(trk(r.t).name)}</em></div>`).join("")}</div>
+    <p>Eleven of the world's great races, lifted above every other race on the calendar as the majors. Six are fixtures; the rest rotate around the world from season to season. Points to tenth in each, from Sydney to Paris to Kentucky to Tokyo. The ten best stables meet in the Final at Flemington.</p></div>`;
+}
+(function(){
+  const st = document.createElement("style");
+  st.textContent = `.fwc-globe{width:min(1100px,96%);text-align:center;animation:fwcUp .5s ease}
+  .fwc-globe .bug{display:inline-block;font-size:10.5px;letter-spacing:.3em;color:#e8c15a;border:1px solid rgba(232,193,90,.5);padding:3px 10px;border-radius:5px;margin-bottom:10px}
+  .fwc-globe svg{width:100%;height:auto;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.6),0 0 0 1px rgba(199,154,62,.35)}
+  .fwc-legend{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:4px 14px;margin-top:10px;text-align:left}
+  .fwc-legend span{font-size:12.5px;display:flex;align-items:baseline;gap:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fwc-legend b{flex:0 0 22px;color:#111;background:#e8c15a;border-radius:5px;text-align:center;font-size:11px}
+  .fwc-legend small{color:#e8c15a;opacity:.85}
+  .fwc-glist{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:5px 14px;margin-top:10px;text-align:left}
+  .fwc-glist div{display:grid;grid-template-columns:46px 1fr;font-size:12.5px;line-height:1.25}.fwc-glist b{grid-row:span 2;color:#e8c15a}.fwc-glist em{font-style:normal;font-size:11px;color:rgba(244,241,234,.6)}
+  .fwc-globe p{max-width:760px;margin:12px auto 0;font-size:clamp(14px,1.6vw,18px);line-height:1.5;color:rgba(244,241,234,.88)}
+  .fwc-pin{opacity:0;animation:fwcPinIn .5s ease forwards}
+  .fwc-ping{transform-box:fill-box;transform-origin:center;animation:fwcPing 1.6s ease-out infinite}
+  .fwc-route{stroke-dashoffset:4000;animation-name:fwcRoute;animation-timing-function:linear;animation-fill-mode:forwards}
+  @keyframes fwcPinIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+  @keyframes fwcPing{from{opacity:.9;transform:scale(.4)}to{opacity:0;transform:scale(1.6)}}
+  @keyframes fwcRoute{from{stroke-dashoffset:4000}to{stroke-dashoffset:0}}`;
+  document.head.appendChild(st);
+})();
+
+
+// ---- v47: international racing opens with a Group 2 or Open win ------------------
+(function f27IntlGate(){
+  const UNLOCK = ["G2","OPEN","G1","WC","SLOT"];
+  const unlocked = C => !!(C && (C.intlOpen || (C.g1 || 0) > 0));
+  const grant = (C, race) => {
+    if(!C || C.intlOpen || !race || !UNLOCK.includes(race.g)) return;
+    C.intlOpen = true;
+    feed(C, `A ${race.g === "OPEN" ? "Open" : race.g} winner: international racing is now open to your stable. Travel to any overseas meeting your horses are ready for.`, "big");
+  };
+  const _e = entryCheck;
+  entryCheck = function(h, race, C){
+    const CC = C || app.career;
+    if(race && race.intl && !race.wc && !race.fwcFinal && CC){
+      if(!unlocked(CC)) return "International races open once your stable wins a Group 2 or an Open";
+      return _e.call(this, h, Object.assign({}, race, { intl:false }), C);
+    }
+    return _e.apply(this, arguments);
+  };
+  const _a = applyRaceResult;
+  applyRaceResult = function(C, R, race){
+    try {
+      if(C && R && R.results && race){
+        const ids = new Set([C.horse && C.horse.id].concat((C.string||[]).map(sh=>sh.h && sh.h.id)).filter(Boolean));
+        if(R.results.some(r=>ids.has(r.h.id) && r.place === 1)) grant(C, race);
+      }
+    } catch(e){}
+    return _a.apply(this, arguments);
+  };
+  const _s = applyStringResult;
+  applyStringResult = function(C, sh, me, race){ try { if(me && me.place === 1) grant(C, race); } catch(e){} return _s.apply(this, arguments); };
 })();
 
 </script>
